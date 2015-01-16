@@ -154,15 +154,15 @@ private[kafka] abstract class AbstractServerThread(connectionQuotas: ConnectionQ
   def close(key: SelectionKey) {
     if(key != null) {
       key.attach(null)
-      close(key.channel.asInstanceOf[SocketChannel])
+      close(key.channel.asInstanceOf[SocketChannel], key)
       swallowError(key.cancel())
     }
   }
   
-  def close(channel: SocketChannel) {
+  def close(channel: SocketChannel, key: SelectionKey) {
     if(channel != null) {
       debug("Closing connection from " + channel.socket.getRemoteSocketAddress())
-      connectionQuotas.dec(channel.socket.getInetAddress)
+      connectionQuotas.dec(key, channel.socket.getInetAddress)
       swallowError(channel.socket().close())
       swallowError(channel.close())
     }
@@ -269,7 +269,7 @@ private[kafka] class Acceptor(val host: String,
     val serverSocketChannel = key.channel().asInstanceOf[ServerSocketChannel]
     val socketChannel = serverSocketChannel.accept()
     try {
-      connectionQuotas.inc(socketChannel.socket().getInetAddress)
+      connectionQuotas.inc(key, socketChannel.socket().getInetAddress)
       socketChannel.configureBlocking(false)
       socketChannel.socket().setTcpNoDelay(true)
       socketChannel.socket().setSendBufferSize(sendBufferSize)
@@ -283,7 +283,7 @@ private[kafka] class Acceptor(val host: String,
     } catch {
       case e: TooManyConnectionsException =>
         info("Rejected connection from %s, address already has the configured maximum of %d connections.".format(e.ip, e.count))
-        close(socketChannel)
+        close(socketChannel, key)
     }
   }
 
@@ -508,24 +508,29 @@ private[kafka] class Processor(val id: Int,
 class ConnectionQuotas(val defaultMax: Int, overrideQuotas: Map[String, Int]) {
   private val overrides = overrideQuotas.map(entry => (InetAddress.getByName(entry._1), entry._2))
   private val counts = mutable.Map[InetAddress, Int]()
+  private val accountedKeys = mutable.Set.empty[SelectionKey]
   
-  def inc(addr: InetAddress) {
+  def inc(key: SelectionKey, addr: InetAddress) {
     counts synchronized {
+      accountedKeys.add(key)
       val count = counts.getOrElse(addr, 0)
-      counts.put(addr, count + 1)
+      counts(addr) = count + 1
       val max = overrides.getOrElse(addr, defaultMax)
       if(count >= max)
         throw new TooManyConnectionsException(addr, max)
     }
   }
   
-  def dec(addr: InetAddress) {
+  def dec(key: SelectionKey, addr: InetAddress) {
     counts synchronized {
-      val count = counts.get(addr).get
-      if(count == 1)
-        counts.remove(addr)
-      else
-        counts.put(addr, count - 1)
+      if (accountedKeys.contains(key)) {
+        accountedKeys.remove(key)
+        val count = counts(addr)
+        if(count == 1)
+          counts.remove(addr)
+        else
+          counts.put(addr, count - 1)
+      }
     }
   }
   
